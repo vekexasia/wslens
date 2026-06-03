@@ -4,19 +4,19 @@ $script:CwdWin = (Get-Location).Path
 
 function Show-Usage {
 @'
-winctl: list, capture, and manipulate Windows top-level windows from WSL
+wslens: list, capture, and manipulate Windows top-level windows from WSL
 
 Usage:
-  winctl list [--all] [--json] [--title REGEX] [--process REGEX]
-  winctl bounds <target> [--json]
-  winctl capture <target> [-o PATH] [--restore] [--json]
-  winctl resize <target> <width> <height> [--x X] [--y Y] [--restore] [--activate] [--json]
-  winctl move <target> <x> <y> [--restore] [--activate] [--json]
-  winctl focus <target>
-  winctl close <target> [--json]
+  wslens list [--all] [--json] [--title REGEX] [--process REGEX]
+  wslens bounds <target> [--json]
+  wslens capture <target> [-o PATH] [--restore] [--json]
+  wslens resize <target> <width> <height> [--x X] [--y Y] [--restore] [--activate] [--json]
+  wslens move <target> <x> <y> [--restore] [--activate] [--json]
+  wslens focus <target>
+  wslens close <target> [--json]
 
 Targets:
-  idx:N             window index from `winctl list`
+  idx:N             window index from `wslens list`
   N                 same as idx:N if N matches a listed index
   0xHWND            window handle, e.g. 0x8032E
   hwnd:0xHWND       explicit window handle
@@ -24,12 +24,12 @@ Targets:
   process:REGEX     first listed window whose process matches REGEX
 
 Examples:
-  winctl list
-  winctl capture idx:16 -o shot.png
-  winctl resize 16 1200 800
-  winctl resize 0x8032E 1200 800 --x 100 --y 80
-  winctl move title:Spotify 50 50
-  winctl close title:Spotify
+  wslens list
+  wslens capture idx:16 -o shot.png
+  wslens resize 16 1200 800
+  wslens resize 0x8032E 1200 800 --x 100 --y 80
+  wslens move title:Spotify 50 50
+  wslens close title:Spotify
 '@
 }
 
@@ -430,7 +430,7 @@ switch ($cmd) {
   }
 
   'bounds' {
-    if ($cmdArgs.Count -lt 1) { Fail 'Usage: winctl bounds <target> [--json]' }
+    if ($cmdArgs.Count -lt 1) { Fail 'Usage: wslens bounds <target> [--json]' }
     $target = $cmdArgs[0]
     $json = $false
     for ($i = 1; $i -lt $cmdArgs.Count; $i++) {
@@ -445,7 +445,7 @@ switch ($cmd) {
   }
 
   'capture' {
-    if ($cmdArgs.Count -lt 1) { Fail 'Usage: winctl capture <target> [-o PATH] [--restore] [--json]' }
+    if ($cmdArgs.Count -lt 1) { Fail 'Usage: wslens capture <target> [-o PATH] [--restore] [--json]' }
     $target = $cmdArgs[0]
     $output = $null
     $restore = $false
@@ -474,7 +474,7 @@ switch ($cmd) {
   }
 
   'resize' {
-    if ($cmdArgs.Count -lt 3) { Fail 'Usage: winctl resize <target> <width> <height> [--x X] [--y Y] [--restore] [--activate] [--json]' }
+    if ($cmdArgs.Count -lt 3) { Fail 'Usage: wslens resize <target> <width> <height> [--x X] [--y Y] [--restore] [--activate] [--json]' }
     $target = $cmdArgs[0]
     $width = Parse-Int $cmdArgs[1] 'width'
     $height = Parse-Int $cmdArgs[2] 'height'
@@ -505,7 +505,7 @@ switch ($cmd) {
   }
 
   'move' {
-    if ($cmdArgs.Count -lt 3) { Fail 'Usage: winctl move <target> <x> <y> [--restore] [--activate] [--json]' }
+    if ($cmdArgs.Count -lt 3) { Fail 'Usage: wslens move <target> <x> <y> [--restore] [--activate] [--json]' }
     $target = $cmdArgs[0]
     $x = Parse-Int $cmdArgs[1] 'x'
     $y = Parse-Int $cmdArgs[2] 'y'
@@ -529,7 +529,7 @@ switch ($cmd) {
   }
 
   'close' {
-    if ($cmdArgs.Count -lt 1) { Fail 'Usage: winctl close <target> [--json]' }
+    if ($cmdArgs.Count -lt 1) { Fail 'Usage: wslens close <target> [--json]' }
     $target = $cmdArgs[0]
     $json = $false
 
@@ -547,7 +547,7 @@ switch ($cmd) {
   }
 
   'focus' {
-    if ($cmdArgs.Count -ne 1) { Fail 'Usage: winctl focus <target>' }
+    if ($cmdArgs.Count -ne 1) { Fail 'Usage: wslens focus <target>' }
     $win = Resolve-Target $cmdArgs[0] $false
     $hwnd = [IntPtr]$win.HwndValue
     [void][WinCtlNative]::ShowWindow($hwnd, 9)

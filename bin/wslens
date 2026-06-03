@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-script="$HOME/.local/share/winctl/winctl.ps1"
+script="$HOME/.local/share/wslens/wslens.ps1"
 if [[ ! -f "$script" ]]; then
-  echo "winctl: missing PowerShell backend: $script" >&2
+  echo "wslens: missing PowerShell backend: $script" >&2
   exit 1
 fi
 if ! command -v powershell.exe >/dev/null 2>&1; then
-  echo "winctl: powershell.exe not found in PATH" >&2
+  echo "wslens: powershell.exe not found in PATH" >&2
   exit 1
 fi
 
