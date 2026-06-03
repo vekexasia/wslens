@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script="$HOME/.local/share/winctl/winctl.ps1"
+if [[ ! -f "$script" ]]; then
+  echo "winctl: missing PowerShell backend: $script" >&2
+  exit 1
+fi
+if ! command -v powershell.exe >/dev/null 2>&1; then
+  echo "winctl: powershell.exe not found in PATH" >&2
+  exit 1
+fi
+
+is_windows_path() {
+  [[ "$1" =~ ^[A-Za-z]:\\ ]] || [[ "$1" == \\\\* ]]
+}
+
+to_windows_path() {
+  local p="$1"
+  if is_windows_path "$p"; then
+    printf '%s\n' "$p"
+  else
+    wslpath -w "$(realpath -m "$p")"
+  fi
+}
+
+cwd_win="$(wslpath -w "$PWD")"
+script_win="$(wslpath -w "$script")"
+
+args=()
+convert_next=0
+for arg in "$@"; do
+  if (( convert_next )); then
+    args+=("$(to_windows_path "$arg")")
+    convert_next=0
+    continue
+  fi
+
+  case "$arg" in
+    -o|--output)
+      args+=("$arg")
+      convert_next=1
+      ;;
+    --output=*)
+      args+=("--output=$(to_windows_path "${arg#--output=}")")
+      ;;
+    *)
+      args+=("$arg")
+      ;;
+  esac
+done
+
+exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$script_win" --cwd-win "$cwd_win" "${args[@]}"
