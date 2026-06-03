@@ -1,5 +1,7 @@
 # wslens
 
+![wslens hero: WSL code inspected through a lens into Windows application windows](assets/wslens-hero.png)
+
 `wslens` lets WSL scripts list, capture, move, resize, focus, and close Windows top-level windows.
 
 It is useful when a tool runs inside WSL but the application under test opens in Windows user space. For example, a coding agent can launch a Windows app, inspect its windows, take screenshots, resize it into a known shape, focus it, and close it again from the WSL side.
