@@ -12,7 +12,7 @@ Usage:
   wslens capture <target> [-o PATH] [--restore] [--json]
   wslens resize <target> <width> <height> [--x X] [--y Y] [--restore] [--activate] [--json]
   wslens move <target> <x> <y> [--restore] [--activate] [--json]
-  wslens focus <target>
+  wslens focus <target> [--json]
   wslens close <target> [--json]
 
 Targets:
@@ -33,9 +33,24 @@ Examples:
 '@
 }
 
+# Raise a terminating error carrying an explicit process exit code. The
+# top-level dispatcher reads Exception.Data['ExitCode'] to set the real exit
+# status. Using throw (not Write-Error + exit) keeps the code honoured and
+# makes Fail testable when the script is dot-sourced.
 function Fail([string]$Message, [int]$Code = 1) {
-  Write-Error $Message
-  exit $Code
+  $err = New-Object System.Exception($Message)
+  $err.Data['ExitCode'] = $Code
+  throw $err
+}
+
+# Validate a user-supplied regular expression before it reaches -match, so a
+# malformed pattern fails cleanly instead of surfacing a raw .NET exception.
+function Assert-ValidRegex([string]$Pattern) {
+  try {
+    [void][System.Text.RegularExpressions.Regex]::new($Pattern)
+  } catch {
+    Fail "Invalid regular expression: $Pattern"
+  }
 }
 
 function Strip-InternalArgs([object[]]$InputArgs) {
@@ -51,13 +66,6 @@ function Strip-InternalArgs([object[]]$InputArgs) {
     }
   }
   return @($list.ToArray())
-}
-
-$argv = @(Strip-InternalArgs $args)
-
-if ($argv.Count -eq 0 -or $argv[0] -eq '--help' -or $argv[0] -eq '-h' -or $argv[0] -eq 'help') {
-  Show-Usage
-  exit 0
 }
 
 Add-Type -AssemblyName System.Drawing
@@ -122,6 +130,14 @@ public class WinCtlNative {
 }
 "@
 
+# Named Win32 constants used below.
+$script:SW_RESTORE          = 9
+$script:PW_RENDERFULLCONTENT = 2
+$script:SWP_NOSIZE          = 0x0001
+$script:SWP_NOZORDER        = 0x0004
+$script:SWP_NOACTIVATE      = 0x0010
+$script:WM_CLOSE            = 0x0010
+
 [void][WinCtlNative]::SetProcessDPIAware()
 
 function Parse-Int([string]$Value, [string]$Name) {
@@ -134,7 +150,11 @@ function Parse-HwndValue([string]$Value) {
   $s = $Value
   if ($s.StartsWith('hwnd:', [System.StringComparison]::OrdinalIgnoreCase)) { $s = $s.Substring(5) }
   if ($s.StartsWith('0x', [System.StringComparison]::OrdinalIgnoreCase)) {
-    return [Convert]::ToInt64($s.Substring(2), 16)
+    try {
+      return [Convert]::ToInt64($s.Substring(2), 16)
+    } catch {
+      Fail "Invalid HWND: $Value"
+    }
   }
   $n = 0L
   if (-not [Int64]::TryParse($s, [ref]$n)) { Fail "Invalid HWND: $Value" }
@@ -147,7 +167,9 @@ function Get-State([IntPtr]$Hwnd) {
   return 'normal'
 }
 
-function Get-WindowObjectFromHwnd([IntPtr]$Hwnd, [int]$Idx) {
+# Single source of truth for extracting a window's properties from an HWND.
+# Both the EnumWindows listing callback and the direct-HWND resolver use this.
+function Get-WindowInfo([IntPtr]$Hwnd) {
   $sb = New-Object System.Text.StringBuilder 2048
   [void][WinCtlNative]::GetWindowText($Hwnd, $sb, $sb.Capacity)
   $title = $sb.ToString()
@@ -171,7 +193,6 @@ function Get-WindowObjectFromHwnd([IntPtr]$Hwnd, [int]$Idx) {
   }
 
   return [pscustomobject]@{
-    Idx = $Idx
     Hwnd = ('0x{0:X}' -f $Hwnd.ToInt64())
     HwndValue = $Hwnd.ToInt64()
     Pid = $procId
@@ -186,51 +207,21 @@ function Get-WindowObjectFromHwnd([IntPtr]$Hwnd, [int]$Idx) {
   }
 }
 
+function Get-WindowObjectFromHwnd([IntPtr]$Hwnd, [int]$Idx) {
+  $info = Get-WindowInfo $Hwnd
+  return ($info | Add-Member -NotePropertyName Idx -NotePropertyValue $Idx -Force -PassThru)
+}
+
 function Get-Windows([bool]$IncludeAll) {
   $rows = New-Object 'System.Collections.Generic.List[object]'
   $cb = [WinCtlNative+EnumWindowsProc]{
     param([IntPtr]$hwnd, [IntPtr]$lparam)
 
-    $visible = [WinCtlNative]::IsWindowVisible($hwnd)
-    $sb = New-Object System.Text.StringBuilder 2048
-    [void][WinCtlNative]::GetWindowText($hwnd, $sb, $sb.Capacity)
-    $title = $sb.ToString()
-
-    if (-not $IncludeAll -and (-not $visible -or [string]::IsNullOrWhiteSpace($title))) {
+    $info = Get-WindowInfo $hwnd
+    if (-not $IncludeAll -and (-not $info.Visible -or [string]::IsNullOrWhiteSpace($info.Title))) {
       return $true
     }
-
-    [uint32]$procId = 0
-    [void][WinCtlNative]::GetWindowThreadProcessId($hwnd, [ref]$procId)
-    $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
-
-    $rect = New-Object WinCtlNative+RECT
-    $rectOk = [WinCtlNative]::GetWindowRect($hwnd, [ref]$rect)
-    if ($rectOk) {
-      $x = $rect.Left
-      $y = $rect.Top
-      $width = $rect.Right - $rect.Left
-      $height = $rect.Bottom - $rect.Top
-    } else {
-      $x = 0
-      $y = 0
-      $width = 0
-      $height = 0
-    }
-
-    [void]$rows.Add([pscustomobject]@{
-      Hwnd = ('0x{0:X}' -f $hwnd.ToInt64())
-      HwndValue = $hwnd.ToInt64()
-      Pid = $procId
-      Process = if ($proc) { $proc.ProcessName } else { '?' }
-      Title = $title
-      X = $x
-      Y = $y
-      Width = $width
-      Height = $height
-      State = Get-State $hwnd
-      Visible = $visible
-    })
+    [void]$rows.Add($info)
     return $true
   }
 
@@ -239,20 +230,7 @@ function Get-Windows([bool]$IncludeAll) {
   $idx = 0
   @($rows | Sort-Object Process, Title, HwndValue | ForEach-Object {
     $idx++
-    [pscustomobject]@{
-      Idx = $idx
-      Hwnd = $_.Hwnd
-      HwndValue = $_.HwndValue
-      Pid = $_.Pid
-      Process = $_.Process
-      Title = $_.Title
-      X = $_.X
-      Y = $_.Y
-      Width = $_.Width
-      Height = $_.Height
-      State = $_.State
-      Visible = $_.Visible
-    }
+    $_ | Add-Member -NotePropertyName Idx -NotePropertyValue $idx -Force -PassThru
   })
 }
 
@@ -268,6 +246,7 @@ function Resolve-Target([string]$Target, [bool]$IncludeAll) {
 
   if ($Target.StartsWith('title:', [System.StringComparison]::OrdinalIgnoreCase)) {
     $pattern = $Target.Substring(6)
+    Assert-ValidRegex $pattern
     $match = $windows | Where-Object { $_.Title -match $pattern } | Select-Object -First 1
     if (-not $match) { Fail "No listed window title matches: $pattern" }
     return $match
@@ -275,6 +254,7 @@ function Resolve-Target([string]$Target, [bool]$IncludeAll) {
 
   if ($Target.StartsWith('process:', [System.StringComparison]::OrdinalIgnoreCase)) {
     $pattern = $Target.Substring(8)
+    Assert-ValidRegex $pattern
     $match = $windows | Where-Object { $_.Process -match $pattern } | Select-Object -First 1
     if (-not $match) { Fail "No listed window process matches: $pattern" }
     return $match
@@ -312,17 +292,8 @@ function Select-DisplayColumns($Items) {
   $Items | Select-Object Idx,Hwnd,Pid,Process,Title,X,Y,Width,Height,State,Visible
 }
 
-
 function Write-Table($Items) {
   $Items | Format-Table -AutoSize | Out-String -Width 300 | Write-Host -NoNewline
-}
-
-function Write-ObjectOutput($Object, [bool]$Json) {
-  if ($Json) {
-    $Object | ConvertTo-Json -Depth 5
-  } else {
-    $Object
-  }
 }
 
 function Get-DefaultCapturePath($Win) {
@@ -332,7 +303,7 @@ function Get-DefaultCapturePath($Win) {
 
 function Capture-Window($Win, [string]$OutputPath, [bool]$RestoreFirst) {
   $hwnd = [IntPtr]$Win.HwndValue
-  if ($RestoreFirst -and [WinCtlNative]::IsIconic($hwnd)) { [void][WinCtlNative]::ShowWindow($hwnd, 9) }
+  if ($RestoreFirst -and [WinCtlNative]::IsIconic($hwnd)) { [void][WinCtlNative]::ShowWindow($hwnd, $script:SW_RESTORE) }
 
   $rect = New-Object WinCtlNative+RECT
   if (-not [WinCtlNative]::GetWindowRect($hwnd, [ref]$rect)) {
@@ -347,17 +318,16 @@ function Capture-Window($Win, [string]$OutputPath, [bool]$RestoreFirst) {
   if (-not [string]::IsNullOrWhiteSpace($dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
 
   $bmp = New-Object System.Drawing.Bitmap $width, $height
-  $gfx = [System.Drawing.Graphics]::FromImage($bmp)
-  $hdc = $gfx.GetHdc()
-  $ok = $false
   try {
-    $ok = [WinCtlNative]::PrintWindow($hwnd, $hdc, 2)
-  } finally {
-    $gfx.ReleaseHdc($hdc)
-    $gfx.Dispose()
-  }
-
-  try {
+    $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+    $hdc = $gfx.GetHdc()
+    $ok = $false
+    try {
+      $ok = [WinCtlNative]::PrintWindow($hwnd, $hdc, $script:PW_RENDERFULLCONTENT)
+    } finally {
+      $gfx.ReleaseHdc($hdc)
+      $gfx.Dispose()
+    }
     $bmp.Save($OutputPath, [System.Drawing.Imaging.ImageFormat]::Png)
   } finally {
     $bmp.Dispose()
@@ -376,10 +346,10 @@ function Capture-Window($Win, [string]$OutputPath, [bool]$RestoreFirst) {
 
 function Set-WindowBounds($Win, [int]$X, [int]$Y, [int]$Width, [int]$Height, [bool]$RestoreFirst, [bool]$Activate) {
   $hwnd = [IntPtr]$Win.HwndValue
-  if ($RestoreFirst -and [WinCtlNative]::IsIconic($hwnd)) { [void][WinCtlNative]::ShowWindow($hwnd, 9) }
+  if ($RestoreFirst -and [WinCtlNative]::IsIconic($hwnd)) { [void][WinCtlNative]::ShowWindow($hwnd, $script:SW_RESTORE) }
 
-  $flags = 0x0004
-  if (-not $Activate) { $flags = $flags -bor 0x0010 }
+  $flags = $script:SWP_NOZORDER
+  if (-not $Activate) { $flags = $flags -bor $script:SWP_NOACTIVATE }
   $ok = [WinCtlNative]::SetWindowPos($hwnd, [IntPtr]::Zero, $X, $Y, $Width, $Height, [uint32]$flags)
   if (-not $ok) { Fail "SetWindowPos failed for $($Win.Hwnd): $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
   return Get-WindowObjectFromHwnd $hwnd $Win.Idx
@@ -387,8 +357,7 @@ function Set-WindowBounds($Win, [int]$X, [int]$Y, [int]$Width, [int]$Height, [bo
 
 function Close-Window($Win) {
   $hwnd = [IntPtr]$Win.HwndValue
-  $wmClose = 0x0010
-  $ok = [WinCtlNative]::PostMessage($hwnd, [uint32]$wmClose, [IntPtr]::Zero, [IntPtr]::Zero)
+  $ok = [WinCtlNative]::PostMessage($hwnd, [uint32]$script:WM_CLOSE, [IntPtr]::Zero, [IntPtr]::Zero)
   if (-not $ok) { Fail "PostMessage(WM_CLOSE) failed for $($Win.Hwnd): $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
   return [pscustomobject]@{
     Hwnd = $Win.Hwnd
@@ -396,168 +365,206 @@ function Close-Window($Win) {
   }
 }
 
-$cmd = $argv[0].ToLowerInvariant()
-$cmdArgs = @()
-if ($argv.Count -gt 1) { $cmdArgs = @($argv[1..($argv.Count - 1)]) }
-
-switch ($cmd) {
-  'list' {
-    $includeAll = $false
-    $json = $false
-    $titleFilter = $null
-    $processFilter = $null
-
-    for ($i = 0; $i -lt $cmdArgs.Count; $i++) {
-      switch -Regex ($cmdArgs[$i]) {
-        '^--all$' { $includeAll = $true; continue }
-        '^--json$' { $json = $true; continue }
-        '^--title$' { $titleFilter = Get-ArgValue $cmdArgs ([ref]$i) '--title'; continue }
-        '^--process$' { $processFilter = Get-ArgValue $cmdArgs ([ref]$i) '--process'; continue }
-        default { Fail "Unknown list option: $($cmdArgs[$i])" }
-      }
-    }
-
-    $wins = @(Get-Windows $includeAll)
-    if ($titleFilter) { $wins = @($wins | Where-Object { $_.Title -match $titleFilter }) }
-    if ($processFilter) { $wins = @($wins | Where-Object { $_.Process -match $processFilter }) }
-
-    if ($json) {
-      $wins | ConvertTo-Json -Depth 5
-    } else {
-      Write-Table (Select-DisplayColumns $wins)
-    }
-    break
+function Focus-Window($Win) {
+  $hwnd = [IntPtr]$Win.HwndValue
+  if ([WinCtlNative]::IsIconic($hwnd)) { [void][WinCtlNative]::ShowWindow($hwnd, $script:SW_RESTORE) }
+  $ok = [WinCtlNative]::SetForegroundWindow($hwnd)
+  return [pscustomobject]@{
+    Hwnd = $Win.Hwnd
+    Focused = $ok
   }
+}
 
-  'bounds' {
-    if ($cmdArgs.Count -lt 1) { Fail 'Usage: wslens bounds <target> [--json]' }
-    $target = $cmdArgs[0]
-    $json = $false
-    for ($i = 1; $i -lt $cmdArgs.Count; $i++) {
-      switch ($cmdArgs[$i]) {
-        '--json' { $json = $true }
-        default { Fail "Unknown bounds option: $($cmdArgs[$i])" }
+function Invoke-Wslens([string[]]$Argv) {
+  $cmd = $Argv[0].ToLowerInvariant()
+  $cmdArgs = @()
+  if ($Argv.Count -gt 1) { $cmdArgs = @($Argv[1..($Argv.Count - 1)]) }
+
+  switch ($cmd) {
+    'list' {
+      $includeAll = $false
+      $json = $false
+      $titleFilter = $null
+      $processFilter = $null
+
+      for ($i = 0; $i -lt $cmdArgs.Count; $i++) {
+        switch -Regex ($cmdArgs[$i]) {
+          '^--all$' { $includeAll = $true; continue }
+          '^--json$' { $json = $true; continue }
+          '^--title$' { $titleFilter = Get-ArgValue $cmdArgs ([ref]$i) '--title'; continue }
+          '^--process$' { $processFilter = Get-ArgValue $cmdArgs ([ref]$i) '--process'; continue }
+          default { Fail "Unknown list option: $($cmdArgs[$i])" }
+        }
       }
-    }
-    $win = Resolve-Target $target $false
-    Write-ObjectOutput (Select-DisplayColumns @($win)) $json
-    break
-  }
 
-  'capture' {
-    if ($cmdArgs.Count -lt 1) { Fail 'Usage: wslens capture <target> [-o PATH] [--restore] [--json]' }
-    $target = $cmdArgs[0]
-    $output = $null
-    $restore = $false
-    $json = $false
+      $wins = @(Get-Windows $includeAll)
+      if ($titleFilter) { Assert-ValidRegex $titleFilter; $wins = @($wins | Where-Object { $_.Title -match $titleFilter }) }
+      if ($processFilter) { Assert-ValidRegex $processFilter; $wins = @($wins | Where-Object { $_.Process -match $processFilter }) }
 
-    for ($i = 1; $i -lt $cmdArgs.Count; $i++) {
-      $a = $cmdArgs[$i]
-      if ($a -eq '-o' -or $a -eq '--output') {
-        $output = Get-ArgValue $cmdArgs ([ref]$i) $a
-      } elseif ($a.StartsWith('--output=', [System.StringComparison]::OrdinalIgnoreCase)) {
-        $output = $a.Substring(9)
-      } elseif ($a -eq '--restore') {
-        $restore = $true
-      } elseif ($a -eq '--json') {
-        $json = $true
+      if ($json) {
+        $wins | ConvertTo-Json -Depth 5
       } else {
-        Fail "Unknown capture option: $a"
+        Write-Table (Select-DisplayColumns $wins)
       }
+      break
     }
 
-    $win = Resolve-Target $target $false
-    if (-not $output) { $output = Get-DefaultCapturePath $win }
-    $result = Capture-Window $win $output $restore
-    if ($json) { $result | ConvertTo-Json -Depth 5 } else { $result | Format-List }
-    break
-  }
-
-  'resize' {
-    if ($cmdArgs.Count -lt 3) { Fail 'Usage: wslens resize <target> <width> <height> [--x X] [--y Y] [--restore] [--activate] [--json]' }
-    $target = $cmdArgs[0]
-    $width = Parse-Int $cmdArgs[1] 'width'
-    $height = Parse-Int $cmdArgs[2] 'height'
-    $x = $null
-    $y = $null
-    $restore = $false
-    $activate = $false
-    $json = $false
-
-    for ($i = 3; $i -lt $cmdArgs.Count; $i++) {
-      switch ($cmdArgs[$i]) {
-        '--x' { $x = Parse-Int (Get-ArgValue $cmdArgs ([ref]$i) '--x') 'x' }
-        '--y' { $y = Parse-Int (Get-ArgValue $cmdArgs ([ref]$i) '--y') 'y' }
-        '--restore' { $restore = $true }
-        '--activate' { $activate = $true }
-        '--json' { $json = $true }
-        default { Fail "Unknown resize option: $($cmdArgs[$i])" }
+    'bounds' {
+      if ($cmdArgs.Count -lt 1) { Fail 'Usage: wslens bounds <target> [--json]' }
+      $target = $cmdArgs[0]
+      $json = $false
+      for ($i = 1; $i -lt $cmdArgs.Count; $i++) {
+        switch ($cmdArgs[$i]) {
+          '--json' { $json = $true }
+          default { Fail "Unknown bounds option: $($cmdArgs[$i])" }
+        }
       }
+      $win = Resolve-Target $target $false
+      if ($json) { Select-DisplayColumns @($win) | ConvertTo-Json -Depth 5 } else { Write-Table (Select-DisplayColumns @($win)) }
+      break
     }
 
-    if ($width -le 0 -or $height -le 0) { Fail 'Width and height must be positive' }
-    $win = Resolve-Target $target $false
-    if ($null -eq $x) { $x = [int]$win.X }
-    if ($null -eq $y) { $y = [int]$win.Y }
-    $after = Set-WindowBounds $win $x $y $width $height $restore $activate
-    if ($json) { $after | ConvertTo-Json -Depth 5 } else { Write-Table (Select-DisplayColumns @($after)) }
-    break
-  }
+    'capture' {
+      if ($cmdArgs.Count -lt 1) { Fail 'Usage: wslens capture <target> [-o PATH] [--restore] [--json]' }
+      $target = $cmdArgs[0]
+      $output = $null
+      $restore = $false
+      $json = $false
 
-  'move' {
-    if ($cmdArgs.Count -lt 3) { Fail 'Usage: wslens move <target> <x> <y> [--restore] [--activate] [--json]' }
-    $target = $cmdArgs[0]
-    $x = Parse-Int $cmdArgs[1] 'x'
-    $y = Parse-Int $cmdArgs[2] 'y'
-    $restore = $false
-    $activate = $false
-    $json = $false
-
-    for ($i = 3; $i -lt $cmdArgs.Count; $i++) {
-      switch ($cmdArgs[$i]) {
-        '--restore' { $restore = $true }
-        '--activate' { $activate = $true }
-        '--json' { $json = $true }
-        default { Fail "Unknown move option: $($cmdArgs[$i])" }
+      for ($i = 1; $i -lt $cmdArgs.Count; $i++) {
+        $a = $cmdArgs[$i]
+        if ($a -eq '-o' -or $a -eq '--output') {
+          $output = Get-ArgValue $cmdArgs ([ref]$i) $a
+        } elseif ($a.StartsWith('--output=', [System.StringComparison]::OrdinalIgnoreCase)) {
+          $output = $a.Substring(9)
+        } elseif ($a -eq '--restore') {
+          $restore = $true
+        } elseif ($a -eq '--json') {
+          $json = $true
+        } else {
+          Fail "Unknown capture option: $a"
+        }
       }
+
+      $win = Resolve-Target $target $false
+      if (-not $output) { $output = Get-DefaultCapturePath $win }
+      $result = Capture-Window $win $output $restore
+      if ($json) { $result | ConvertTo-Json -Depth 5 } else { $result | Format-List }
+      break
     }
 
-    $win = Resolve-Target $target $false
-    $after = Set-WindowBounds $win $x $y ([int]$win.Width) ([int]$win.Height) $restore $activate
-    if ($json) { $after | ConvertTo-Json -Depth 5 } else { Write-Table (Select-DisplayColumns @($after)) }
-    break
-  }
+    'resize' {
+      if ($cmdArgs.Count -lt 3) { Fail 'Usage: wslens resize <target> <width> <height> [--x X] [--y Y] [--restore] [--activate] [--json]' }
+      $target = $cmdArgs[0]
+      $width = Parse-Int $cmdArgs[1] 'width'
+      $height = Parse-Int $cmdArgs[2] 'height'
+      $x = $null
+      $y = $null
+      $restore = $false
+      $activate = $false
+      $json = $false
 
-  'close' {
-    if ($cmdArgs.Count -lt 1) { Fail 'Usage: wslens close <target> [--json]' }
-    $target = $cmdArgs[0]
-    $json = $false
-
-    for ($i = 1; $i -lt $cmdArgs.Count; $i++) {
-      switch ($cmdArgs[$i]) {
-        '--json' { $json = $true }
-        default { Fail "Unknown close option: $($cmdArgs[$i])" }
+      for ($i = 3; $i -lt $cmdArgs.Count; $i++) {
+        switch ($cmdArgs[$i]) {
+          '--x' { $x = Parse-Int (Get-ArgValue $cmdArgs ([ref]$i) '--x') 'x' }
+          '--y' { $y = Parse-Int (Get-ArgValue $cmdArgs ([ref]$i) '--y') 'y' }
+          '--restore' { $restore = $true }
+          '--activate' { $activate = $true }
+          '--json' { $json = $true }
+          default { Fail "Unknown resize option: $($cmdArgs[$i])" }
+        }
       }
+
+      if ($width -le 0 -or $height -le 0) { Fail 'Width and height must be positive' }
+      $win = Resolve-Target $target $false
+      if ($null -eq $x) { $x = [int]$win.X }
+      if ($null -eq $y) { $y = [int]$win.Y }
+      $after = Set-WindowBounds $win $x $y $width $height $restore $activate
+      if ($json) { $after | ConvertTo-Json -Depth 5 } else { Write-Table (Select-DisplayColumns @($after)) }
+      break
     }
 
-    $win = Resolve-Target $target $false
-    $result = Close-Window $win
-    if ($json) { $result | ConvertTo-Json -Depth 5 } else { $result | Format-List }
-    break
-  }
+    'move' {
+      if ($cmdArgs.Count -lt 3) { Fail 'Usage: wslens move <target> <x> <y> [--restore] [--activate] [--json]' }
+      $target = $cmdArgs[0]
+      $x = Parse-Int $cmdArgs[1] 'x'
+      $y = Parse-Int $cmdArgs[2] 'y'
+      $restore = $false
+      $activate = $false
+      $json = $false
 
-  'focus' {
-    if ($cmdArgs.Count -ne 1) { Fail 'Usage: wslens focus <target>' }
-    $win = Resolve-Target $cmdArgs[0] $false
-    $hwnd = [IntPtr]$win.HwndValue
-    [void][WinCtlNative]::ShowWindow($hwnd, 9)
-    $ok = [WinCtlNative]::SetForegroundWindow($hwnd)
-    [pscustomobject]@{ Hwnd = $win.Hwnd; Focused = $ok } | Format-List
-    break
-  }
+      for ($i = 3; $i -lt $cmdArgs.Count; $i++) {
+        switch ($cmdArgs[$i]) {
+          '--restore' { $restore = $true }
+          '--activate' { $activate = $true }
+          '--json' { $json = $true }
+          default { Fail "Unknown move option: $($cmdArgs[$i])" }
+        }
+      }
 
-  default {
-    Show-Usage
-    Fail "Unknown command: $cmd"
+      $win = Resolve-Target $target $false
+      $after = Set-WindowBounds $win $x $y ([int]$win.Width) ([int]$win.Height) $restore $activate
+      if ($json) { $after | ConvertTo-Json -Depth 5 } else { Write-Table (Select-DisplayColumns @($after)) }
+      break
+    }
+
+    'close' {
+      if ($cmdArgs.Count -lt 1) { Fail 'Usage: wslens close <target> [--json]' }
+      $target = $cmdArgs[0]
+      $json = $false
+
+      for ($i = 1; $i -lt $cmdArgs.Count; $i++) {
+        switch ($cmdArgs[$i]) {
+          '--json' { $json = $true }
+          default { Fail "Unknown close option: $($cmdArgs[$i])" }
+        }
+      }
+
+      $win = Resolve-Target $target $false
+      $result = Close-Window $win
+      if ($json) { $result | ConvertTo-Json -Depth 5 } else { $result | Format-List }
+      break
+    }
+
+    'focus' {
+      if ($cmdArgs.Count -lt 1) { Fail 'Usage: wslens focus <target> [--json]' }
+      $target = $cmdArgs[0]
+      $json = $false
+
+      for ($i = 1; $i -lt $cmdArgs.Count; $i++) {
+        switch ($cmdArgs[$i]) {
+          '--json' { $json = $true }
+          default { Fail "Unknown focus option: $($cmdArgs[$i])" }
+        }
+      }
+
+      $win = Resolve-Target $target $false
+      $result = Focus-Window $win
+      if ($json) { $result | ConvertTo-Json -Depth 5 } else { $result | Format-List }
+      break
+    }
+
+    default {
+      Show-Usage
+      Fail "Unknown command: $cmd"
+    }
+  }
+}
+
+# Only dispatch when executed as a script (e.g. powershell -File). When the
+# file is dot-sourced (tests), just define the functions above.
+if ($MyInvocation.InvocationName -ne '.') {
+  try {
+    $argv = @(Strip-InternalArgs $args)
+    if ($argv.Count -eq 0 -or $argv[0] -eq '--help' -or $argv[0] -eq '-h' -or $argv[0] -eq 'help') {
+      Show-Usage
+      exit 0
+    }
+    Invoke-Wslens $argv
+  } catch {
+    $code = 1
+    if ($null -ne $_.Exception.Data['ExitCode']) { $code = [int]$_.Exception.Data['ExitCode'] }
+    [Console]::Error.WriteLine('wslens: ' + $_.Exception.Message)
+    exit $code
   }
 }

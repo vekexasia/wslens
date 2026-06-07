@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-script="$HOME/.local/share/wslens/wslens.ps1"
+script="${WSLENS_SHARE_DIR:-$HOME/.local/share/wslens}/wslens.ps1"
 if [[ ! -f "$script" ]]; then
   echo "wslens: missing PowerShell backend: $script" >&2
   exit 1

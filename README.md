@@ -37,7 +37,7 @@ wslens bounds <target> [--json]
 wslens capture <target> [-o PATH] [--restore] [--json]
 wslens resize <target> <width> <height> [--x X] [--y Y] [--restore] [--activate] [--json]
 wslens move <target> <x> <y> [--restore] [--activate] [--json]
-wslens focus <target>
+wslens focus <target> [--json]
 wslens close <target> [--json]
 ```
 
