@@ -4,16 +4,26 @@ $script:CwdWin = (Get-Location).Path
 
 function Show-Usage {
 @'
-wslens: list, capture, and manipulate Windows top-level windows from WSL
+wslens: list, capture, manipulate, and drive Windows windows from WSL
 
 Usage:
   wslens list [--all] [--json] [--title REGEX] [--process REGEX]
   wslens bounds <target> [--json]
   wslens capture <target> [-o PATH] [--restore] [--json]
+  wslens screen [-o PATH] [--json]
   wslens resize <target> <width> <height> [--x X] [--y Y] [--restore] [--activate] [--json]
   wslens move <target> <x> <y> [--restore] [--activate] [--json]
   wslens focus <target> [--json]
+  wslens click <target> <x> <y> [--relative] [--restore] [--activate] [--json]
+  wslens drag <target> <x1> <y1> <x2> <y2> [--relative] [--restore] [--activate] [--json]
+  wslens key <target> <sendkeys> [--restore] [--activate] [--json]
+  wslens type <target> <text> [--restore] [--activate] [--json]
   wslens close <target> [--json]
+  wslens launch <command-or-uri> [args...] [--json]
+  wslens active [--json]
+  wslens monitors [--json]
+  wslens screensaver [--json]
+  wslens wake [--json]
 
 Targets:
   idx:N             window index from `wslens list`
@@ -26,10 +36,20 @@ Targets:
 Examples:
   wslens list
   wslens capture idx:16 -o shot.png
+  wslens screen -o desktop.png
   wslens resize 16 1200 800
   wslens resize 0x8032E 1200 800 --x 100 --y 80
   wslens move title:Spotify 50 50
+  wslens click title:Calculator 42 180 --relative
+  wslens key title:Chrome '^l'
+  wslens type title:Notepad 'hello from WSL'
   wslens close title:Spotify
+  wslens launch notepad.exe C:\temp\notes.txt
+  wslens launch https://example.com
+  wslens active --json
+  wslens monitors
+  wslens screensaver
+  wslens wake
 '@
 }
 
@@ -69,6 +89,7 @@ function Strip-InternalArgs([object[]]$InputArgs) {
 }
 
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
 
 Add-Type @"
 using System;
@@ -125,8 +146,20 @@ public class WinCtlNative {
   [DllImport("user32.dll")]
   public static extern bool SetForegroundWindow(IntPtr hWnd);
 
+  [DllImport("user32.dll")]
+  public static extern IntPtr GetForegroundWindow();
+
   [DllImport("user32.dll", SetLastError=true)]
   public static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+  [DllImport("user32.dll", SetLastError=true)]
+  public static extern bool SetCursorPos(int X, int Y);
+
+  [DllImport("user32.dll", SetLastError=true)]
+  public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+
+  [DllImport("user32.dll", SetLastError=true)]
+  public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, ref bool pvParam, uint fWinIni);
 }
 "@
 
@@ -137,6 +170,10 @@ $script:SWP_NOSIZE          = 0x0001
 $script:SWP_NOZORDER        = 0x0004
 $script:SWP_NOACTIVATE      = 0x0010
 $script:WM_CLOSE            = 0x0010
+$script:MOUSEEVENTF_LEFTDOWN = 0x0002
+$script:MOUSEEVENTF_LEFTUP   = 0x0004
+$script:MOUSEEVENTF_MOVE     = 0x0001
+$script:SPI_GETSCREENSAVERRUNNING = 0x0072
 
 [void][WinCtlNative]::SetProcessDPIAware()
 
@@ -296,6 +333,28 @@ function Write-Table($Items) {
   $Items | Format-Table -AutoSize | Out-String -Width 300 | Write-Host -NoNewline
 }
 
+# JSON output contract: all keys are snake_case (e.g. hwnd, pid, work_width,
+# screensaver_running). Converts PascalCase property names recursively before
+# serializing.
+function ConvertTo-SnakeKeys($Value) {
+  if ($Value -is [System.Array]) {
+    return @($Value | ForEach-Object { ConvertTo-SnakeKeys $_ })
+  }
+  if ($Value -is [pscustomobject]) {
+    $out = [ordered]@{}
+    foreach ($p in $Value.PSObject.Properties) {
+      $key = [regex]::Replace($p.Name, '(?<=[a-z0-9])([A-Z])', '_$1').ToLowerInvariant()
+      $out[$key] = ConvertTo-SnakeKeys $p.Value
+    }
+    return [pscustomobject]$out
+  }
+  return $Value
+}
+
+function Out-Json($Value) {
+  ConvertTo-SnakeKeys $Value | ConvertTo-Json -Depth 5
+}
+
 function Get-DefaultCapturePath($Win) {
   $name = 'window-{0}-{1}.png' -f $Win.Idx, ($Win.Hwnd -replace ':', '')
   return [System.IO.Path]::Combine($script:CwdWin, $name)
@@ -374,6 +433,143 @@ function Focus-Window($Win) {
     Focused = $ok
   }
 }
+function Get-DefaultScreenPath() {
+  return [System.IO.Path]::Combine($script:CwdWin, 'screen.png')
+}
+
+function Capture-Screen([string]$OutputPath) {
+  $bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+  $dir = [System.IO.Path]::GetDirectoryName($OutputPath)
+  if (-not [string]::IsNullOrWhiteSpace($dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
+
+  $bmp = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
+  try {
+    $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+    try {
+      $gfx.CopyFromScreen($bounds.Left, $bounds.Top, 0, 0, $bounds.Size)
+    } finally {
+      $gfx.Dispose()
+    }
+    $bmp.Save($OutputPath, [System.Drawing.Imaging.ImageFormat]::Png)
+  } finally {
+    $bmp.Dispose()
+  }
+
+  $file = Get-Item -LiteralPath $OutputPath
+  return [pscustomobject]@{
+    X = $bounds.Left
+    Y = $bounds.Top
+    Width = $bounds.Width
+    Height = $bounds.Height
+    Bytes = $file.Length
+    Path = $file.FullName
+  }
+}
+
+function Get-WindowPoint($Win, [int]$X, [int]$Y, [bool]$Relative) {
+  if ($Relative) {
+    return [pscustomobject]@{ X = ([int]$Win.X + $X); Y = ([int]$Win.Y + $Y) }
+  }
+  return [pscustomobject]@{ X = $X; Y = $Y }
+}
+
+function Prepare-InputWindow($Win, [bool]$RestoreFirst, [bool]$Activate) {
+  $hwnd = [IntPtr]$Win.HwndValue
+  if ($RestoreFirst -and [WinCtlNative]::IsIconic($hwnd)) { [void][WinCtlNative]::ShowWindow($hwnd, $script:SW_RESTORE) }
+  if ($Activate) { [void][WinCtlNative]::SetForegroundWindow($hwnd); Start-Sleep -Milliseconds 100 }
+}
+
+function Invoke-MouseClick($Win, [int]$X, [int]$Y, [bool]$Relative, [bool]$RestoreFirst, [bool]$Activate) {
+  Prepare-InputWindow $Win $RestoreFirst $Activate
+  $p = Get-WindowPoint $Win $X $Y $Relative
+  if (-not [WinCtlNative]::SetCursorPos($p.X, $p.Y)) { Fail "SetCursorPos failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
+  [WinCtlNative]::mouse_event([uint32]$script:MOUSEEVENTF_LEFTDOWN, [uint32]0, [uint32]0, 0, [UIntPtr]::Zero)
+  [WinCtlNative]::mouse_event([uint32]$script:MOUSEEVENTF_LEFTUP, [uint32]0, [uint32]0, 0, [UIntPtr]::Zero)
+  return [pscustomobject]@{ Hwnd = $Win.Hwnd; X = $p.X; Y = $p.Y; Clicked = $true }
+}
+
+function Invoke-MouseDrag($Win, [int]$X1, [int]$Y1, [int]$X2, [int]$Y2, [bool]$Relative, [bool]$RestoreFirst, [bool]$Activate) {
+  Prepare-InputWindow $Win $RestoreFirst $Activate
+  $a = Get-WindowPoint $Win $X1 $Y1 $Relative
+  $b = Get-WindowPoint $Win $X2 $Y2 $Relative
+  if (-not [WinCtlNative]::SetCursorPos($a.X, $a.Y)) { Fail "SetCursorPos failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
+  [WinCtlNative]::mouse_event([uint32]$script:MOUSEEVENTF_LEFTDOWN, [uint32]0, [uint32]0, 0, [UIntPtr]::Zero)
+  Start-Sleep -Milliseconds 80
+  if (-not [WinCtlNative]::SetCursorPos($b.X, $b.Y)) { Fail "SetCursorPos failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
+  Start-Sleep -Milliseconds 80
+  [WinCtlNative]::mouse_event([uint32]$script:MOUSEEVENTF_LEFTUP, [uint32]0, [uint32]0, 0, [UIntPtr]::Zero)
+  return [pscustomobject]@{ Hwnd = $Win.Hwnd; FromX = $a.X; FromY = $a.Y; ToX = $b.X; ToY = $b.Y; Dragged = $true }
+}
+
+function Send-KeysToWindow($Win, [string]$Keys, [bool]$RestoreFirst, [bool]$Activate) {
+  Prepare-InputWindow $Win $RestoreFirst $Activate
+  [System.Windows.Forms.SendKeys]::SendWait($Keys)
+  return [pscustomobject]@{ Hwnd = $Win.Hwnd; Keys = $Keys; Sent = $true }
+}
+
+function Send-TextToWindow($Win, [string]$Text, [bool]$RestoreFirst, [bool]$Activate) {
+  Prepare-InputWindow $Win $RestoreFirst $Activate
+  Set-Clipboard -Value $Text
+  [System.Windows.Forms.SendKeys]::SendWait('^v')
+  return [pscustomobject]@{ Hwnd = $Win.Hwnd; Characters = $Text.Length; Sent = $true }
+}
+
+function Start-WindowsTarget([string]$Target, [string[]]$TargetArgs) {
+  if ($TargetArgs.Count -gt 0) {
+    $proc = Start-Process -FilePath $Target -ArgumentList $TargetArgs -PassThru
+  } else {
+    $proc = Start-Process -FilePath $Target -PassThru
+  }
+  # URIs/documents launched via shell may not yield a process object
+  return [pscustomobject]@{
+    Target = $Target
+    Arguments = $TargetArgs
+    Pid = if ($proc) { $proc.Id } else { $null }
+    Process = if ($proc) { $proc.ProcessName } else { $null }
+  }
+}
+
+function Get-ForegroundWindowObject() {
+  $hwnd = [WinCtlNative]::GetForegroundWindow()
+  if ($hwnd -eq [IntPtr]::Zero) { Fail 'No foreground window' }
+  return Get-WindowObjectFromHwnd $hwnd 0
+}
+
+function Get-Monitors() {
+  @([System.Windows.Forms.Screen]::AllScreens | ForEach-Object {
+    [pscustomobject]@{
+      DeviceName = $_.DeviceName
+      Primary = $_.Primary
+      X = $_.Bounds.X
+      Y = $_.Bounds.Y
+      Width = $_.Bounds.Width
+      Height = $_.Bounds.Height
+      WorkX = $_.WorkingArea.X
+      WorkY = $_.WorkingArea.Y
+      WorkWidth = $_.WorkingArea.Width
+      WorkHeight = $_.WorkingArea.Height
+    }
+  })
+}
+
+function Get-ScreensaverRunning() {
+  $running = $false
+  if (-not [WinCtlNative]::SystemParametersInfo([uint32]$script:SPI_GETSCREENSAVERRUNNING, 0, [ref]$running, 0)) {
+    Fail "SystemParametersInfo(SPI_GETSCREENSAVERRUNNING) failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+  }
+  return [pscustomobject]@{ ScreensaverRunning = $running }
+}
+
+function Invoke-Wake() {
+  # ponytail: a small mouse jiggle dismisses the screensaver; it cannot unlock
+  # a locked workstation (that needs credentials by design), so
+  # ScreensaverDismissed=true says nothing about whether the session is usable.
+  [WinCtlNative]::mouse_event([uint32]$script:MOUSEEVENTF_MOVE, [uint32]1, [uint32]1, 0, [UIntPtr]::Zero)
+  [WinCtlNative]::mouse_event([uint32]$script:MOUSEEVENTF_MOVE, [uint32]0, [uint32]0, 0, [UIntPtr]::Zero)
+  Start-Sleep -Milliseconds 200
+  $after = Get-ScreensaverRunning
+  return [pscustomobject]@{ ScreensaverDismissed = (-not $after.ScreensaverRunning); ScreensaverRunning = $after.ScreensaverRunning }
+}
 
 function Invoke-Wslens([string[]]$Argv) {
   $cmd = $Argv[0].ToLowerInvariant()
@@ -402,7 +598,7 @@ function Invoke-Wslens([string[]]$Argv) {
       if ($processFilter) { Assert-ValidRegex $processFilter; $wins = @($wins | Where-Object { $_.Process -match $processFilter }) }
 
       if ($json) {
-        $wins | ConvertTo-Json -Depth 5
+        Out-Json $wins
       } else {
         Write-Table (Select-DisplayColumns $wins)
       }
@@ -420,7 +616,7 @@ function Invoke-Wslens([string[]]$Argv) {
         }
       }
       $win = Resolve-Target $target $false
-      if ($json) { Select-DisplayColumns @($win) | ConvertTo-Json -Depth 5 } else { Write-Table (Select-DisplayColumns @($win)) }
+      if ($json) { Out-Json (Select-DisplayColumns @($win)) } else { Write-Table (Select-DisplayColumns @($win)) }
       break
     }
 
@@ -449,7 +645,29 @@ function Invoke-Wslens([string[]]$Argv) {
       $win = Resolve-Target $target $false
       if (-not $output) { $output = Get-DefaultCapturePath $win }
       $result = Capture-Window $win $output $restore
-      if ($json) { $result | ConvertTo-Json -Depth 5 } else { $result | Format-List }
+      if ($json) { Out-Json $result } else { $result | Format-List }
+      break
+    }
+    'screen' {
+      $output = $null
+      $json = $false
+
+      for ($i = 0; $i -lt $cmdArgs.Count; $i++) {
+        $a = $cmdArgs[$i]
+        if ($a -eq '-o' -or $a -eq '--output') {
+          $output = Get-ArgValue $cmdArgs ([ref]$i) $a
+        } elseif ($a.StartsWith('--output=', [System.StringComparison]::OrdinalIgnoreCase)) {
+          $output = $a.Substring(9)
+        } elseif ($a -eq '--json') {
+          $json = $true
+        } else {
+          Fail "Unknown screen option: $a"
+        }
+      }
+
+      if (-not $output) { $output = Get-DefaultScreenPath }
+      $result = Capture-Screen $output
+      if ($json) { Out-Json $result } else { $result | Format-List }
       break
     }
 
@@ -480,7 +698,7 @@ function Invoke-Wslens([string[]]$Argv) {
       if ($null -eq $x) { $x = [int]$win.X }
       if ($null -eq $y) { $y = [int]$win.Y }
       $after = Set-WindowBounds $win $x $y $width $height $restore $activate
-      if ($json) { $after | ConvertTo-Json -Depth 5 } else { Write-Table (Select-DisplayColumns @($after)) }
+      if ($json) { Out-Json $after } else { Write-Table (Select-DisplayColumns @($after)) }
       break
     }
 
@@ -504,7 +722,7 @@ function Invoke-Wslens([string[]]$Argv) {
 
       $win = Resolve-Target $target $false
       $after = Set-WindowBounds $win $x $y ([int]$win.Width) ([int]$win.Height) $restore $activate
-      if ($json) { $after | ConvertTo-Json -Depth 5 } else { Write-Table (Select-DisplayColumns @($after)) }
+      if ($json) { Out-Json $after } else { Write-Table (Select-DisplayColumns @($after)) }
       break
     }
 
@@ -522,7 +740,7 @@ function Invoke-Wslens([string[]]$Argv) {
 
       $win = Resolve-Target $target $false
       $result = Close-Window $win
-      if ($json) { $result | ConvertTo-Json -Depth 5 } else { $result | Format-List }
+      if ($json) { Out-Json $result } else { $result | Format-List }
       break
     }
 
@@ -540,7 +758,165 @@ function Invoke-Wslens([string[]]$Argv) {
 
       $win = Resolve-Target $target $false
       $result = Focus-Window $win
-      if ($json) { $result | ConvertTo-Json -Depth 5 } else { $result | Format-List }
+      if ($json) { Out-Json $result } else { $result | Format-List }
+      break
+    }
+
+    'click' {
+      if ($cmdArgs.Count -lt 3) { Fail 'Usage: wslens click <target> <x> <y> [--relative] [--restore] [--activate] [--json]' }
+      $target = $cmdArgs[0]
+      $x = Parse-Int $cmdArgs[1] 'x'
+      $y = Parse-Int $cmdArgs[2] 'y'
+      $relative = $false
+      $restore = $false
+      $activate = $false
+      $json = $false
+      for ($i = 3; $i -lt $cmdArgs.Count; $i++) {
+        switch ($cmdArgs[$i]) {
+          '--relative' { $relative = $true }
+          '--restore' { $restore = $true }
+          '--activate' { $activate = $true }
+          '--json' { $json = $true }
+          default { Fail "Unknown click option: $($cmdArgs[$i])" }
+        }
+      }
+      $win = Resolve-Target $target $false
+      $result = Invoke-MouseClick $win $x $y $relative $restore $activate
+      if ($json) { Out-Json $result } else { $result | Format-List }
+      break
+    }
+
+    'drag' {
+      if ($cmdArgs.Count -lt 5) { Fail 'Usage: wslens drag <target> <x1> <y1> <x2> <y2> [--relative] [--restore] [--activate] [--json]' }
+      $target = $cmdArgs[0]
+      $x1 = Parse-Int $cmdArgs[1] 'x1'
+      $y1 = Parse-Int $cmdArgs[2] 'y1'
+      $x2 = Parse-Int $cmdArgs[3] 'x2'
+      $y2 = Parse-Int $cmdArgs[4] 'y2'
+      $relative = $false
+      $restore = $false
+      $activate = $false
+      $json = $false
+      for ($i = 5; $i -lt $cmdArgs.Count; $i++) {
+        switch ($cmdArgs[$i]) {
+          '--relative' { $relative = $true }
+          '--restore' { $restore = $true }
+          '--activate' { $activate = $true }
+          '--json' { $json = $true }
+          default { Fail "Unknown drag option: $($cmdArgs[$i])" }
+        }
+      }
+      $win = Resolve-Target $target $false
+      $result = Invoke-MouseDrag $win $x1 $y1 $x2 $y2 $relative $restore $activate
+      if ($json) { Out-Json $result } else { $result | Format-List }
+      break
+    }
+
+    'key' {
+      if ($cmdArgs.Count -lt 2) { Fail 'Usage: wslens key <target> <sendkeys> [--restore] [--activate] [--json]' }
+      $target = $cmdArgs[0]
+      $keys = $cmdArgs[1]
+      $restore = $false
+      $activate = $false
+      $json = $false
+      for ($i = 2; $i -lt $cmdArgs.Count; $i++) {
+        switch ($cmdArgs[$i]) {
+          '--restore' { $restore = $true }
+          '--activate' { $activate = $true }
+          '--json' { $json = $true }
+          default { Fail "Unknown key option: $($cmdArgs[$i])" }
+        }
+      }
+      $win = Resolve-Target $target $false
+      $result = Send-KeysToWindow $win $keys $restore $activate
+      if ($json) { Out-Json $result } else { $result | Format-List }
+      break
+    }
+
+    'type' {
+      if ($cmdArgs.Count -lt 2) { Fail 'Usage: wslens type <target> <text> [--restore] [--activate] [--json]' }
+      $target = $cmdArgs[0]
+      $text = $cmdArgs[1]
+      $restore = $false
+      $activate = $false
+      $json = $false
+      for ($i = 2; $i -lt $cmdArgs.Count; $i++) {
+        switch ($cmdArgs[$i]) {
+          '--restore' { $restore = $true }
+          '--activate' { $activate = $true }
+          '--json' { $json = $true }
+          default { Fail "Unknown type option: $($cmdArgs[$i])" }
+        }
+      }
+      $win = Resolve-Target $target $false
+      $result = Send-TextToWindow $win $text $restore $activate
+      if ($json) { Out-Json $result } else { $result | Format-List }
+      break
+    }
+    'launch' {
+      $json = $false
+      if ($cmdArgs.Count -gt 0 -and $cmdArgs[$cmdArgs.Count - 1] -eq '--json') {
+        $json = $true
+        $cmdArgs = @($cmdArgs | Select-Object -First ($cmdArgs.Count - 1))
+      }
+      if ($cmdArgs.Count -lt 1) { Fail 'Usage: wslens launch <command-or-uri> [args...] [--json]' }
+      $target = $cmdArgs[0]
+      $targetArgs = @()
+      if ($cmdArgs.Count -gt 1) { $targetArgs = @($cmdArgs[1..($cmdArgs.Count - 1)]) }
+      $result = Start-WindowsTarget $target $targetArgs
+      if ($json) { Out-Json $result } else { $result | Format-List }
+      break
+    }
+
+    'active' {
+      $json = $false
+      for ($i = 0; $i -lt $cmdArgs.Count; $i++) {
+        switch ($cmdArgs[$i]) {
+          '--json' { $json = $true }
+          default { Fail "Unknown active option: $($cmdArgs[$i])" }
+        }
+      }
+      $win = Get-ForegroundWindowObject
+      if ($json) { Out-Json (Select-DisplayColumns @($win)) } else { Write-Table (Select-DisplayColumns @($win)) }
+      break
+    }
+
+    'monitors' {
+      $json = $false
+      for ($i = 0; $i -lt $cmdArgs.Count; $i++) {
+        switch ($cmdArgs[$i]) {
+          '--json' { $json = $true }
+          default { Fail "Unknown monitors option: $($cmdArgs[$i])" }
+        }
+      }
+      $mons = Get-Monitors
+      if ($json) { Out-Json $mons } else { Write-Table $mons }
+      break
+    }
+
+    'screensaver' {
+      $json = $false
+      for ($i = 0; $i -lt $cmdArgs.Count; $i++) {
+        switch ($cmdArgs[$i]) {
+          '--json' { $json = $true }
+          default { Fail "Unknown screensaver option: $($cmdArgs[$i])" }
+        }
+      }
+      $result = Get-ScreensaverRunning
+      if ($json) { Out-Json $result } else { $result | Format-List }
+      break
+    }
+
+    'wake' {
+      $json = $false
+      for ($i = 0; $i -lt $cmdArgs.Count; $i++) {
+        switch ($cmdArgs[$i]) {
+          '--json' { $json = $true }
+          default { Fail "Unknown wake option: $($cmdArgs[$i])" }
+        }
+      }
+      $result = Invoke-Wake
+      if ($json) { Out-Json $result } else { $result | Format-List }
       break
     }
 

@@ -73,3 +73,38 @@ Describe 'Get-Windows listing' {
     $wins[0].Idx | Should Be 1
   }
 }
+
+Describe 'Get-Monitors' {
+  It 'returns at least one screen with a primary' {
+    $mons = @(Get-Monitors)
+    $mons.Count | Should BeGreaterThan 0
+    @($mons | Where-Object { $_.Primary }).Count | Should Be 1
+    $names = $mons[0].PSObject.Properties.Name
+    foreach ($p in 'DeviceName','Primary','X','Y','Width','Height','WorkX','WorkY','WorkWidth','WorkHeight') {
+      $names -contains $p | Should Be $true
+    }
+  }
+}
+
+Describe 'Get-ForegroundWindowObject' {
+  It 'returns a window object with Hwnd when a foreground window exists' {
+    if ([WinCtlNative]::GetForegroundWindow() -eq [IntPtr]::Zero) { return }
+    $win = Get-ForegroundWindowObject
+    $win.Hwnd | Should Not BeNullOrEmpty
+  }
+}
+
+Describe 'Input coordinate helpers' {
+  It 'keeps absolute coordinates unchanged' {
+    $win = [pscustomobject]@{ X = 100; Y = 50 }
+    $p = Get-WindowPoint $win 10 20 $false
+    $p.X | Should Be 10
+    $p.Y | Should Be 20
+  }
+  It 'converts relative window coordinates to screen coordinates' {
+    $win = [pscustomobject]@{ X = 100; Y = 50 }
+    $p = Get-WindowPoint $win 10 20 $true
+    $p.X | Should Be 110
+    $p.Y | Should Be 70
+  }
+}
