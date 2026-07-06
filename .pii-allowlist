@@ -5,4 +5,4 @@
 # Examples:
 # (?i)^support@example\.com$
 # (?i)^user\d+@test\.com$
-(?i)^name: wslens$
+(?i)^wslens$
