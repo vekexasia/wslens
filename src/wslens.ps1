@@ -1,6 +1,8 @@
 $ErrorActionPreference = 'Stop'
 
 $script:CwdWin = (Get-Location).Path
+$script:RecordStatePath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), 'wslens-record.json')
+$script:LeaseStatePath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), 'wslens-input-lease.json')
 
 function Show-Usage {
 @'
@@ -11,13 +13,17 @@ Usage:
   wslens bounds <target> [--json]
   wslens capture <target> [-o PATH] [--restore] [--json]
   wslens screen [-o PATH] [--json]
+  wslens record start <target|screen> [-o PATH] [--fps N] [--json]
+  wslens record stop [--json]
+  wslens lease acquire <target> [--ttl SECONDS] [--json]
+  wslens lease release <token> [--json]
   wslens resize <target> <width> <height> [--x X] [--y Y] [--restore] [--activate] [--json]
   wslens move <target> <x> <y> [--restore] [--activate] [--json]
-  wslens focus <target> [--json]
-  wslens click <target> <x> <y> [--relative] [--restore] [--activate] [--json]
-  wslens drag <target> <x1> <y1> <x2> <y2> [--relative] [--restore] [--activate] [--json]
-  wslens key <target> <sendkeys> [--restore] [--activate] [--json]
-  wslens type <target> <text> [--restore] [--activate] [--json]
+  wslens focus <target> [--lease TOKEN] [--json]
+  wslens click <target> <x> <y> [--relative] [--restore] [--activate] [--lease TOKEN] [--json]
+  wslens drag <target> <x1> <y1> <x2> <y2> [--relative] [--restore] [--activate] [--lease TOKEN] [--json]
+  wslens key <target> <sendkeys> [--restore] [--activate] [--lease TOKEN] [--json]
+  wslens type <target> <text> [--restore] [--activate] [--lease TOKEN] [--json]
   wslens close <target> [--json]
   wslens launch <command-or-uri> [args...] [--json]
   wslens active [--json]
@@ -37,6 +43,8 @@ Examples:
   wslens list
   wslens capture idx:16 -o shot.png
   wslens screen -o desktop.png
+  wslens record start title:Chrome -o demo.mkv --json
+  wslens record stop --json
   wslens resize 16 1200 800
   wslens resize 0x8032E 1200 800 --x 100 --y 80
   wslens move title:Spotify 50 50
@@ -473,14 +481,70 @@ function Get-WindowPoint($Win, [int]$X, [int]$Y, [bool]$Relative) {
   return [pscustomobject]@{ X = $X; Y = $Y }
 }
 
-function Prepare-InputWindow($Win, [bool]$RestoreFirst, [bool]$Activate) {
+function Get-InputLease() {
+  if (-not [System.IO.File]::Exists($script:LeaseStatePath)) { return $null }
+  $lease = Get-Content -LiteralPath $script:LeaseStatePath -Raw | ConvertFrom-Json
+  if ([datetime]$lease.ExpiresAt -le [datetime]::UtcNow) { Remove-Item -LiteralPath $script:LeaseStatePath -ErrorAction SilentlyContinue; return $null }
+  return $lease
+}
+
+function Set-InputLease($Lease) {
+  $Lease | ConvertTo-Json | Set-Content -LiteralPath $script:LeaseStatePath
+}
+function Invoke-InputLeaseLocked([scriptblock]$Body) {
+  $mutex = New-Object System.Threading.Mutex($false, 'Global\wslens-input-lease')
+  $held = $false
+  try {
+    $held = $mutex.WaitOne(5000)
+    if (-not $held) { Fail 'Timed out waiting for input lease lock' }
+    & $Body
+  } finally {
+    if ($held) { $mutex.ReleaseMutex() }
+    $mutex.Dispose()
+  }
+}
+
+function New-InputLease($Win, [int]$TtlSeconds) {
+  Invoke-InputLeaseLocked {
+    if ($TtlSeconds -le 0) { Fail 'TTL must be positive' }
+    $lease = Get-InputLease
+    if ($lease) { Fail "Input leased by $($lease.Target) until $($lease.ExpiresAt)" }
+    $token = [guid]::NewGuid().ToString('N')
+    $lease = [pscustomobject]@{ Token = $token; Target = $Win.Title; Hwnd = $Win.Hwnd; HwndValue = $Win.HwndValue; Pid = $Win.Pid; ExpiresAt = ([datetime]::UtcNow.AddSeconds($TtlSeconds).ToString('o')); TtlSeconds = $TtlSeconds }
+    Set-InputLease $lease
+    $lease
+  }
+}
+
+function Release-InputLease([string]$Token) {
+  Invoke-InputLeaseLocked {
+    $lease = Get-InputLease
+    if (-not $lease) { Fail 'No input lease is active' }
+    if ($lease.Token -ne $Token) { Fail 'Input lease token mismatch' }
+    Remove-Item -LiteralPath $script:LeaseStatePath -ErrorAction SilentlyContinue
+    $lease | Add-Member -NotePropertyName Released -NotePropertyValue $true -Force -PassThru
+  }
+}
+
+function Assert-InputLease($Win, [string]$Token) {
+  $lease = Get-InputLease
+  if (-not $lease) { return }
+  if ([string]::IsNullOrWhiteSpace($Token)) { Fail "Input leased by $($lease.Target) until $($lease.ExpiresAt); pass --lease TOKEN" }
+  if ($lease.Token -ne $Token) { Fail 'Input lease token mismatch' }
+  if ([int64]$lease.HwndValue -ne [int64]$Win.HwndValue) { Fail "Input lease is for $($lease.Hwnd), not $($Win.Hwnd)" }
+  $lease.ExpiresAt = [datetime]::UtcNow.AddSeconds([int]$lease.TtlSeconds).ToString('o')
+  Set-InputLease $lease
+}
+
+function Prepare-InputWindow($Win, [bool]$RestoreFirst, [bool]$Activate, [string]$LeaseToken) {
+  Assert-InputLease $Win $LeaseToken
   $hwnd = [IntPtr]$Win.HwndValue
   if ($RestoreFirst -and [WinCtlNative]::IsIconic($hwnd)) { [void][WinCtlNative]::ShowWindow($hwnd, $script:SW_RESTORE) }
   if ($Activate) { [void][WinCtlNative]::SetForegroundWindow($hwnd); Start-Sleep -Milliseconds 100 }
 }
 
-function Invoke-MouseClick($Win, [int]$X, [int]$Y, [bool]$Relative, [bool]$RestoreFirst, [bool]$Activate) {
-  Prepare-InputWindow $Win $RestoreFirst $Activate
+function Invoke-MouseClick($Win, [int]$X, [int]$Y, [bool]$Relative, [bool]$RestoreFirst, [bool]$Activate, [string]$LeaseToken) {
+  Prepare-InputWindow $Win $RestoreFirst $Activate $LeaseToken
   $p = Get-WindowPoint $Win $X $Y $Relative
   if (-not [WinCtlNative]::SetCursorPos($p.X, $p.Y)) { Fail "SetCursorPos failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
   [WinCtlNative]::mouse_event([uint32]$script:MOUSEEVENTF_LEFTDOWN, [uint32]0, [uint32]0, 0, [UIntPtr]::Zero)
@@ -488,8 +552,8 @@ function Invoke-MouseClick($Win, [int]$X, [int]$Y, [bool]$Relative, [bool]$Resto
   return [pscustomobject]@{ Hwnd = $Win.Hwnd; X = $p.X; Y = $p.Y; Clicked = $true }
 }
 
-function Invoke-MouseDrag($Win, [int]$X1, [int]$Y1, [int]$X2, [int]$Y2, [bool]$Relative, [bool]$RestoreFirst, [bool]$Activate) {
-  Prepare-InputWindow $Win $RestoreFirst $Activate
+function Invoke-MouseDrag($Win, [int]$X1, [int]$Y1, [int]$X2, [int]$Y2, [bool]$Relative, [bool]$RestoreFirst, [bool]$Activate, [string]$LeaseToken) {
+  Prepare-InputWindow $Win $RestoreFirst $Activate $LeaseToken
   $a = Get-WindowPoint $Win $X1 $Y1 $Relative
   $b = Get-WindowPoint $Win $X2 $Y2 $Relative
   if (-not [WinCtlNative]::SetCursorPos($a.X, $a.Y)) { Fail "SetCursorPos failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())" }
@@ -501,14 +565,14 @@ function Invoke-MouseDrag($Win, [int]$X1, [int]$Y1, [int]$X2, [int]$Y2, [bool]$R
   return [pscustomobject]@{ Hwnd = $Win.Hwnd; FromX = $a.X; FromY = $a.Y; ToX = $b.X; ToY = $b.Y; Dragged = $true }
 }
 
-function Send-KeysToWindow($Win, [string]$Keys, [bool]$RestoreFirst, [bool]$Activate) {
-  Prepare-InputWindow $Win $RestoreFirst $Activate
+function Send-KeysToWindow($Win, [string]$Keys, [bool]$RestoreFirst, [bool]$Activate, [string]$LeaseToken) {
+  Prepare-InputWindow $Win $RestoreFirst $Activate $LeaseToken
   [System.Windows.Forms.SendKeys]::SendWait($Keys)
   return [pscustomobject]@{ Hwnd = $Win.Hwnd; Keys = $Keys; Sent = $true }
 }
 
-function Send-TextToWindow($Win, [string]$Text, [bool]$RestoreFirst, [bool]$Activate) {
-  Prepare-InputWindow $Win $RestoreFirst $Activate
+function Send-TextToWindow($Win, [string]$Text, [bool]$RestoreFirst, [bool]$Activate, [string]$LeaseToken) {
+  Prepare-InputWindow $Win $RestoreFirst $Activate $LeaseToken
   Set-Clipboard -Value $Text
   [System.Windows.Forms.SendKeys]::SendWait('^v')
   return [pscustomobject]@{ Hwnd = $Win.Hwnd; Characters = $Text.Length; Sent = $true }
@@ -569,6 +633,94 @@ function Invoke-Wake() {
   Start-Sleep -Milliseconds 200
   $after = Get-ScreensaverRunning
   return [pscustomobject]@{ ScreensaverDismissed = (-not $after.ScreensaverRunning); ScreensaverRunning = $after.ScreensaverRunning }
+}
+function Get-DefaultRecordPath() {
+  return [System.IO.Path]::Combine($script:CwdWin, 'recording.mkv')
+}
+
+function Get-RecordingState() {
+  if (-not [System.IO.File]::Exists($script:RecordStatePath)) { return $null }
+  return (Get-Content -LiteralPath $script:RecordStatePath -Raw | ConvertFrom-Json)
+}
+
+function Get-RunningRecordingState() {
+  $state = Get-RecordingState
+  if (-not $state) { return $null }
+  $proc = Get-Process -Id $state.Pid -ErrorAction SilentlyContinue
+  if (-not $proc) { Remove-Item -LiteralPath $script:RecordStatePath -ErrorAction SilentlyContinue; return $null }
+  return $state
+}
+
+function Quote-ProcessArg([object]$Value) {
+  $s = [string]$Value
+  if ($s -notmatch '[\s"]') { return $s }
+  return '"' + ($s -replace '([\\"])', '\$1') + '"'
+}
+
+function Start-Recording([string]$Target, [string]$OutputPath, [int]$Fps) {
+  if (Get-RunningRecordingState) { Fail 'A wslens recording is already running' }
+  $ffmpeg = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
+  if (-not $ffmpeg) { $ffmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue }
+  if (-not $ffmpeg) { Fail 'ffmpeg not found in PATH' }
+  if ($Fps -le 0) { Fail 'FPS must be positive' }
+
+  $dir = [System.IO.Path]::GetDirectoryName($OutputPath)
+  if (-not [string]::IsNullOrWhiteSpace($dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
+
+  $mode = 'window'
+  $title = $null
+  $hwnd = $null
+  if ($Target -eq 'screen' -or $Target -eq 'desktop') {
+    $inputName = 'desktop'
+    $mode = 'screen'
+  } else {
+    $win = Resolve-Target $Target $false
+    $title = $win.Title
+    $hwnd = $win.Hwnd
+    if ([string]::IsNullOrWhiteSpace($title)) { Fail "Window has no title: $($win.Hwnd)" }
+    $inputName = 'title=' + $title
+  }
+
+  $log = [System.IO.Path]::ChangeExtension($OutputPath, '.ffmpeg.log')
+  $stop = [System.IO.Path]::ChangeExtension($OutputPath, '.stop')
+  $helper = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath(), ('wslens-record-{0}.ps1' -f ([guid]::NewGuid().ToString('N'))))
+  Remove-Item -LiteralPath $stop -ErrorAction SilentlyContinue
+  $args = @('-y', '-loglevel', 'warning', '-f', 'gdigrab', '-framerate', $Fps, '-draw_mouse', '1', '-i', $inputName, '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p', $OutputPath)
+  $argLine = (($args | ForEach-Object { Quote-ProcessArg $_ }) -join ' ')
+  $helperText = @"
+`$psi = New-Object System.Diagnostics.ProcessStartInfo
+`$psi.FileName = '$($ffmpeg.Source -replace '''', '''''')'
+`$psi.Arguments = '$($argLine -replace '''', '''''')'
+`$psi.RedirectStandardInput = `$true
+`$psi.RedirectStandardError = `$true
+`$psi.UseShellExecute = `$false
+`$psi.CreateNoWindow = `$true
+`$p = [System.Diagnostics.Process]::Start(`$psi)
+while (-not [System.IO.File]::Exists('$($stop -replace '''', '''''')') -and -not `$p.HasExited) { Start-Sleep -Milliseconds 200 }
+if (-not `$p.HasExited) { `$p.StandardInput.WriteLine('q') }
+if (-not `$p.WaitForExit(10000)) { `$p.Kill(); `$p.WaitForExit() }
+`$err = `$p.StandardError.ReadToEnd()
+[System.IO.File]::WriteAllText('$($log -replace '''', '''''')', `$err)
+"@
+  Set-Content -LiteralPath $helper -Value $helperText
+  $proc = Start-Process -FilePath powershell.exe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $helper) -PassThru -WindowStyle Hidden
+  $state = [pscustomobject]@{ Pid = $proc.Id; Path = $OutputPath; Log = $log; Stop = $stop; Helper = $helper; Target = $Target; Mode = $mode; Hwnd = $hwnd; Title = $title; Fps = $Fps }
+  $state | ConvertTo-Json | Set-Content -LiteralPath $script:RecordStatePath
+  return ($state | Add-Member -NotePropertyName Started -NotePropertyValue $true -Force -PassThru)
+}
+
+function Stop-Recording() {
+  $state = Get-RecordingState
+  if (-not $state) { Fail 'No wslens recording is running' }
+  $proc = Get-Process -Id $state.Pid -ErrorAction SilentlyContinue
+  [System.IO.File]::WriteAllText($state.Stop, 'stop')
+  if ($proc) { if (-not $proc.WaitForExit(15000)) { Stop-Process -Id $state.Pid -Force } }
+  Remove-Item -LiteralPath $script:RecordStatePath -ErrorAction SilentlyContinue
+  $bytes = 0
+  if ([System.IO.File]::Exists($state.Path)) { $bytes = (Get-Item -LiteralPath $state.Path).Length }
+  Remove-Item -LiteralPath $state.Stop -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath $state.Helper -ErrorAction SilentlyContinue
+  return [pscustomobject]@{ Pid = $state.Pid; Path = $state.Path; Log = $state.Log; Bytes = $bytes; Stopped = $true }
 }
 
 function Invoke-Wslens([string[]]$Argv) {
@@ -671,6 +823,92 @@ function Invoke-Wslens([string[]]$Argv) {
       break
     }
 
+    'record' {
+      if ($cmdArgs.Count -lt 1) { Fail 'Usage: wslens record start <target|screen> [-o PATH] [--fps N] [--json] | wslens record stop [--json]' }
+      $action = $cmdArgs[0].ToLowerInvariant()
+      $json = $false
+
+      if ($action -eq 'start') {
+        if ($cmdArgs.Count -lt 2) { Fail 'Usage: wslens record start <target|screen> [-o PATH] [--fps N] [--json]' }
+        $target = $cmdArgs[1]
+        $output = $null
+        $fps = 15
+
+        for ($i = 2; $i -lt $cmdArgs.Count; $i++) {
+          $a = $cmdArgs[$i]
+          if ($a -eq '-o' -or $a -eq '--output') {
+            $output = Get-ArgValue $cmdArgs ([ref]$i) $a
+          } elseif ($a.StartsWith('--output=', [System.StringComparison]::OrdinalIgnoreCase)) {
+            $output = $a.Substring(9)
+          } elseif ($a -eq '--fps') {
+            $fps = Parse-Int (Get-ArgValue $cmdArgs ([ref]$i) '--fps') 'fps'
+          } elseif ($a -eq '--json') {
+            $json = $true
+          } else {
+            Fail "Unknown record start option: $a"
+          }
+        }
+
+        if (-not $output) { $output = Get-DefaultRecordPath }
+        $result = Start-Recording $target $output $fps
+        if ($json) { Out-Json $result } else { $result | Format-List }
+        break
+      }
+
+      if ($action -eq 'stop') {
+        for ($i = 1; $i -lt $cmdArgs.Count; $i++) {
+          switch ($cmdArgs[$i]) {
+            '--json' { $json = $true }
+            default { Fail "Unknown record stop option: $($cmdArgs[$i])" }
+          }
+        }
+        $result = Stop-Recording
+        if ($json) { Out-Json $result } else { $result | Format-List }
+        break
+      }
+
+      Fail "Unknown record action: $action"
+    }
+
+    'lease' {
+      if ($cmdArgs.Count -lt 1) { Fail 'Usage: wslens lease acquire <target> [--ttl SECONDS] [--json] | wslens lease release <token> [--json]' }
+      $action = $cmdArgs[0].ToLowerInvariant()
+      $json = $false
+
+      if ($action -eq 'acquire') {
+        if ($cmdArgs.Count -lt 2) { Fail 'Usage: wslens lease acquire <target> [--ttl SECONDS] [--json]' }
+        $target = $cmdArgs[1]
+        $ttl = 30
+        for ($i = 2; $i -lt $cmdArgs.Count; $i++) {
+          switch ($cmdArgs[$i]) {
+            '--ttl' { $ttl = Parse-Int (Get-ArgValue $cmdArgs ([ref]$i) '--ttl') 'ttl' }
+            '--json' { $json = $true }
+            default { Fail "Unknown lease acquire option: $($cmdArgs[$i])" }
+          }
+        }
+        $win = Resolve-Target $target $false
+        $result = New-InputLease $win $ttl
+        if ($json) { Out-Json $result } else { $result | Format-List }
+        break
+      }
+
+      if ($action -eq 'release') {
+        if ($cmdArgs.Count -lt 2) { Fail 'Usage: wslens lease release <token> [--json]' }
+        $token = $cmdArgs[1]
+        for ($i = 2; $i -lt $cmdArgs.Count; $i++) {
+          switch ($cmdArgs[$i]) {
+            '--json' { $json = $true }
+            default { Fail "Unknown lease release option: $($cmdArgs[$i])" }
+          }
+        }
+        $result = Release-InputLease $token
+        if ($json) { Out-Json $result } else { $result | Format-List }
+        break
+      }
+
+      Fail "Unknown lease action: $action"
+    }
+
     'resize' {
       if ($cmdArgs.Count -lt 3) { Fail 'Usage: wslens resize <target> <width> <height> [--x X] [--y Y] [--restore] [--activate] [--json]' }
       $target = $cmdArgs[0]
@@ -745,25 +983,28 @@ function Invoke-Wslens([string[]]$Argv) {
     }
 
     'focus' {
-      if ($cmdArgs.Count -lt 1) { Fail 'Usage: wslens focus <target> [--json]' }
+      if ($cmdArgs.Count -lt 1) { Fail 'Usage: wslens focus <target> [--lease TOKEN] [--json]' }
       $target = $cmdArgs[0]
       $json = $false
+      $lease = $null
 
       for ($i = 1; $i -lt $cmdArgs.Count; $i++) {
         switch ($cmdArgs[$i]) {
           '--json' { $json = $true }
+          '--lease' { $lease = Get-ArgValue $cmdArgs ([ref]$i) '--lease' }
           default { Fail "Unknown focus option: $($cmdArgs[$i])" }
         }
       }
 
       $win = Resolve-Target $target $false
+      Assert-InputLease $win $lease
       $result = Focus-Window $win
       if ($json) { Out-Json $result } else { $result | Format-List }
       break
     }
 
     'click' {
-      if ($cmdArgs.Count -lt 3) { Fail 'Usage: wslens click <target> <x> <y> [--relative] [--restore] [--activate] [--json]' }
+      if ($cmdArgs.Count -lt 3) { Fail 'Usage: wslens click <target> <x> <y> [--relative] [--restore] [--activate] [--lease TOKEN] [--json]' }
       $target = $cmdArgs[0]
       $x = Parse-Int $cmdArgs[1] 'x'
       $y = Parse-Int $cmdArgs[2] 'y'
@@ -771,23 +1012,25 @@ function Invoke-Wslens([string[]]$Argv) {
       $restore = $false
       $activate = $false
       $json = $false
+      $lease = $null
       for ($i = 3; $i -lt $cmdArgs.Count; $i++) {
         switch ($cmdArgs[$i]) {
           '--relative' { $relative = $true }
           '--restore' { $restore = $true }
           '--activate' { $activate = $true }
           '--json' { $json = $true }
+          '--lease' { $lease = Get-ArgValue $cmdArgs ([ref]$i) '--lease' }
           default { Fail "Unknown click option: $($cmdArgs[$i])" }
         }
       }
       $win = Resolve-Target $target $false
-      $result = Invoke-MouseClick $win $x $y $relative $restore $activate
+      $result = Invoke-MouseClick $win $x $y $relative $restore $activate $lease
       if ($json) { Out-Json $result } else { $result | Format-List }
       break
     }
 
     'drag' {
-      if ($cmdArgs.Count -lt 5) { Fail 'Usage: wslens drag <target> <x1> <y1> <x2> <y2> [--relative] [--restore] [--activate] [--json]' }
+      if ($cmdArgs.Count -lt 5) { Fail 'Usage: wslens drag <target> <x1> <y1> <x2> <y2> [--relative] [--restore] [--activate] [--lease TOKEN] [--json]' }
       $target = $cmdArgs[0]
       $x1 = Parse-Int $cmdArgs[1] 'x1'
       $y1 = Parse-Int $cmdArgs[2] 'y1'
@@ -797,59 +1040,65 @@ function Invoke-Wslens([string[]]$Argv) {
       $restore = $false
       $activate = $false
       $json = $false
+      $lease = $null
       for ($i = 5; $i -lt $cmdArgs.Count; $i++) {
         switch ($cmdArgs[$i]) {
           '--relative' { $relative = $true }
           '--restore' { $restore = $true }
           '--activate' { $activate = $true }
           '--json' { $json = $true }
+          '--lease' { $lease = Get-ArgValue $cmdArgs ([ref]$i) '--lease' }
           default { Fail "Unknown drag option: $($cmdArgs[$i])" }
         }
       }
       $win = Resolve-Target $target $false
-      $result = Invoke-MouseDrag $win $x1 $y1 $x2 $y2 $relative $restore $activate
+      $result = Invoke-MouseDrag $win $x1 $y1 $x2 $y2 $relative $restore $activate $lease
       if ($json) { Out-Json $result } else { $result | Format-List }
       break
     }
 
     'key' {
-      if ($cmdArgs.Count -lt 2) { Fail 'Usage: wslens key <target> <sendkeys> [--restore] [--activate] [--json]' }
+      if ($cmdArgs.Count -lt 2) { Fail 'Usage: wslens key <target> <sendkeys> [--restore] [--activate] [--lease TOKEN] [--json]' }
       $target = $cmdArgs[0]
       $keys = $cmdArgs[1]
       $restore = $false
       $activate = $false
       $json = $false
+      $lease = $null
       for ($i = 2; $i -lt $cmdArgs.Count; $i++) {
         switch ($cmdArgs[$i]) {
           '--restore' { $restore = $true }
           '--activate' { $activate = $true }
           '--json' { $json = $true }
+          '--lease' { $lease = Get-ArgValue $cmdArgs ([ref]$i) '--lease' }
           default { Fail "Unknown key option: $($cmdArgs[$i])" }
         }
       }
       $win = Resolve-Target $target $false
-      $result = Send-KeysToWindow $win $keys $restore $activate
+      $result = Send-KeysToWindow $win $keys $restore $activate $lease
       if ($json) { Out-Json $result } else { $result | Format-List }
       break
     }
 
     'type' {
-      if ($cmdArgs.Count -lt 2) { Fail 'Usage: wslens type <target> <text> [--restore] [--activate] [--json]' }
+      if ($cmdArgs.Count -lt 2) { Fail 'Usage: wslens type <target> <text> [--restore] [--activate] [--lease TOKEN] [--json]' }
       $target = $cmdArgs[0]
       $text = $cmdArgs[1]
       $restore = $false
       $activate = $false
       $json = $false
+      $lease = $null
       for ($i = 2; $i -lt $cmdArgs.Count; $i++) {
         switch ($cmdArgs[$i]) {
           '--restore' { $restore = $true }
           '--activate' { $activate = $true }
           '--json' { $json = $true }
+          '--lease' { $lease = Get-ArgValue $cmdArgs ([ref]$i) '--lease' }
           default { Fail "Unknown type option: $($cmdArgs[$i])" }
         }
       }
       $win = Resolve-Target $target $false
-      $result = Send-TextToWindow $win $text $restore $activate
+      $result = Send-TextToWindow $win $text $restore $activate $lease
       if ($json) { Out-Json $result } else { $result | Format-List }
       break
     }

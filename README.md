@@ -36,13 +36,17 @@ wslens list [--all] [--json] [--title REGEX] [--process REGEX]
 wslens bounds <target> [--json]
 wslens capture <target> [-o PATH] [--restore] [--json]
 wslens screen [-o PATH] [--json]
+wslens record start <target|screen> [-o PATH] [--fps N] [--json]
+wslens record stop [--json]
+wslens lease acquire <target> [--ttl SECONDS] [--json]
+wslens lease release <token> [--json]
 wslens resize <target> <width> <height> [--x X] [--y Y] [--restore] [--activate] [--json]
 wslens move <target> <x> <y> [--restore] [--activate] [--json]
-wslens focus <target> [--json]
-wslens click <target> <x> <y> [--relative] [--restore] [--activate] [--json]
-wslens drag <target> <x1> <y1> <x2> <y2> [--relative] [--restore] [--activate] [--json]
-wslens key <target> <sendkeys> [--restore] [--activate] [--json]
-wslens type <target> <text> [--restore] [--activate] [--json]
+wslens focus <target> [--lease TOKEN] [--json]
+wslens click <target> <x> <y> [--relative] [--restore] [--activate] [--lease TOKEN] [--json]
+wslens drag <target> <x1> <y1> <x2> <y2> [--relative] [--restore] [--activate] [--lease TOKEN] [--json]
+wslens key <target> <sendkeys> [--restore] [--activate] [--lease TOKEN] [--json]
+wslens type <target> <text> [--restore] [--activate] [--lease TOKEN] [--json]
 wslens close <target> [--json]
 wslens launch <command-or-uri> [args...] [--json]
 wslens active [--json]
@@ -70,6 +74,11 @@ Examples:
 wslens list
 wslens capture idx:16 -o shot.png
 wslens screen -o desktop.png
+wslens record start title:Chrome -o demo.mkv --json
+wslens record stop --json
+token=$(wslens lease acquire title:Chrome --json | jq -r .token)
+wslens key title:Chrome '^l' --activate --lease "$token"
+wslens lease release "$token" --json
 wslens resize 16 1200 800
 wslens resize 0x8032E 1200 800 --x 100 --y 80
 wslens move title:Spotify 50 50
@@ -102,10 +111,13 @@ wslens resize title:MyApp 1400 900 --x 80 --y 80 --activate
 # Capture the current UI into the WSL working directory.
 wslens capture title:MyApp -o artifacts/myapp.png
 
+# Record the window while driving it; defaults to recording.mkv and needs ffmpeg.
+wslens record start title:MyApp -o artifacts/myapp.mkv --json
 # Drive simple UI flows when visual inspection alone is not enough.
 wslens click title:MyApp 240 180 --relative --activate
 wslens type title:MyApp 'hello from WSL' --activate
 
+wslens record stop --json
 # Close it when the run is done.
 wslens close title:MyApp
 ```

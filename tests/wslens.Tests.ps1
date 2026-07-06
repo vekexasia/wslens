@@ -108,3 +108,24 @@ Describe 'Input coordinate helpers' {
     $p.Y | Should Be 70
   }
 }
+
+Describe 'Quote-ProcessArg' {
+  It 'leaves simple args alone' {
+    Quote-ProcessArg 'desktop' | Should Be 'desktop'
+  }
+  It 'quotes args with spaces' {
+    Quote-ProcessArg 'title=My App' | Should Be '"title=My App"'
+  }
+}
+
+Describe 'Input lease' {
+  It 'blocks input without matching token while leased' {
+    Remove-Item -LiteralPath $script:LeaseStatePath -ErrorAction SilentlyContinue
+    $win = [pscustomobject]@{ Title = 'A'; Hwnd = '0x1'; HwndValue = 1; Pid = 1 }
+    $lease = New-InputLease $win 30
+    { Assert-InputLease $win $null } | Should Throw
+    { Assert-InputLease $win 'bad' } | Should Throw
+    { Assert-InputLease $win $lease.Token } | Should Not Throw
+    Remove-Item -LiteralPath $script:LeaseStatePath -ErrorAction SilentlyContinue
+  }
+}
