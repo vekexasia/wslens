@@ -164,7 +164,10 @@ public class WinCtlNative {
   public static extern bool SetCursorPos(int X, int Y);
 
   [DllImport("user32.dll", SetLastError=true)]
-  public static extern void mouse_event(uint dwFlags, uint dx, uint dy, uint dwData, UIntPtr dwExtraInfo);
+  public static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, UIntPtr dwExtraInfo);
+
+  [DllImport("user32.dll", SetLastError=true)]
+  public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
 
   [DllImport("user32.dll", SetLastError=true)]
   public static extern bool SystemParametersInfo(uint uiAction, uint uiParam, ref bool pvParam, uint fWinIni);
@@ -181,6 +184,9 @@ $script:WM_CLOSE            = 0x0010
 $script:MOUSEEVENTF_LEFTDOWN = 0x0002
 $script:MOUSEEVENTF_LEFTUP   = 0x0004
 $script:MOUSEEVENTF_MOVE     = 0x0001
+$script:KEYEVENTF_KEYUP      = 0x0002
+$script:VK_ESCAPE            = 0x1B
+$script:VK_SHIFT             = 0x10
 $script:SPI_GETSCREENSAVERRUNNING = 0x0072
 
 [void][WinCtlNative]::SetProcessDPIAware()
@@ -625,12 +631,16 @@ function Get-ScreensaverRunning() {
 }
 
 function Invoke-Wake() {
-  # ponytail: a small mouse jiggle dismisses the screensaver; it cannot unlock
-  # a locked workstation (that needs credentials by design), so
-  # ScreensaverDismissed=true says nothing about whether the session is usable.
-  [WinCtlNative]::mouse_event([uint32]$script:MOUSEEVENTF_MOVE, [uint32]1, [uint32]1, 0, [UIntPtr]::Zero)
-  [WinCtlNative]::mouse_event([uint32]$script:MOUSEEVENTF_MOVE, [uint32]0, [uint32]0, 0, [UIntPtr]::Zero)
-  Start-Sleep -Milliseconds 200
+  # ponytail: wake is best-effort user input. It can dismiss a normal
+  # screensaver/display-sleep prompt, but cannot unlock a secured session.
+  [WinCtlNative]::mouse_event([uint32]$script:MOUSEEVENTF_MOVE, 10, 10, 0, [UIntPtr]::Zero)
+  Start-Sleep -Milliseconds 50
+  [WinCtlNative]::mouse_event([uint32]$script:MOUSEEVENTF_MOVE, -10, -10, 0, [UIntPtr]::Zero)
+  [WinCtlNative]::keybd_event([byte]$script:VK_SHIFT, 0, 0, [UIntPtr]::Zero)
+  [WinCtlNative]::keybd_event([byte]$script:VK_SHIFT, 0, [uint32]$script:KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+  [WinCtlNative]::keybd_event([byte]$script:VK_ESCAPE, 0, 0, [UIntPtr]::Zero)
+  [WinCtlNative]::keybd_event([byte]$script:VK_ESCAPE, 0, [uint32]$script:KEYEVENTF_KEYUP, [UIntPtr]::Zero)
+  Start-Sleep -Milliseconds 500
   $after = Get-ScreensaverRunning
   return [pscustomobject]@{ ScreensaverDismissed = (-not $after.ScreensaverRunning); ScreensaverRunning = $after.ScreensaverRunning }
 }
