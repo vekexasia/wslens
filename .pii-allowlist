@@ -1,0 +1,8 @@
+# One regex per line. Keep entries narrow.
+# Built-in exceptions already allow localhost, loopback, RFC1918 private LAN URLs,
+# reserved test domains (.test, .example, .invalid), example.com/org/net,
+# GitHub noreply emails, and common test email addresses.
+# Examples:
+# (?i)^support@example\.com$
+# (?i)^user\d+@test\.com$
+(?i)^name: wslens$
