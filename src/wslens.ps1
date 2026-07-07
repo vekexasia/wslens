@@ -6,7 +6,7 @@ $script:LeaseStatePath = [System.IO.Path]::Combine([System.IO.Path]::GetTempPath
 
 function Show-Usage {
 @'
-wslens: list, capture, manipulate, and drive Windows windows from WSL
+wslens: list, capture, manipulate, and drive Windows top-level windows
 
 Usage:
   wslens list [--all] [--json] [--title REGEX] [--process REGEX]
@@ -367,6 +367,12 @@ function ConvertTo-SnakeKeys($Value) {
 
 function Out-Json($Value) {
   ConvertTo-SnakeKeys $Value | ConvertTo-Json -Depth 5
+}
+
+function Resolve-OutputPath([string]$Path) {
+  # No-op for absolute paths; anchors relative paths to the caller's cwd
+  # (Bitmap.Save would otherwise resolve them against the process cwd).
+  return [System.IO.Path]::Combine($script:CwdWin, $Path)
 }
 
 function Get-DefaultCapturePath($Win) {
@@ -805,7 +811,7 @@ function Invoke-Wslens([string[]]$Argv) {
       }
 
       $win = Resolve-Target $target $false
-      if (-not $output) { $output = Get-DefaultCapturePath $win }
+      if (-not $output) { $output = Get-DefaultCapturePath $win } else { $output = Resolve-OutputPath $output }
       $result = Capture-Window $win $output $restore
       if ($json) { Out-Json $result } else { $result | Format-List }
       break
@@ -827,7 +833,7 @@ function Invoke-Wslens([string[]]$Argv) {
         }
       }
 
-      if (-not $output) { $output = Get-DefaultScreenPath }
+      if (-not $output) { $output = Get-DefaultScreenPath } else { $output = Resolve-OutputPath $output }
       $result = Capture-Screen $output
       if ($json) { Out-Json $result } else { $result | Format-List }
       break
@@ -859,7 +865,7 @@ function Invoke-Wslens([string[]]$Argv) {
           }
         }
 
-        if (-not $output) { $output = Get-DefaultRecordPath }
+        if (-not $output) { $output = Get-DefaultRecordPath } else { $output = Resolve-OutputPath $output }
         $result = Start-Recording $target $output $fps
         if ($json) { Out-Json $result } else { $result | Format-List }
         break

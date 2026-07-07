@@ -2,21 +2,22 @@
 
 ![wslens hero: WSL code inspected through a lens into Windows application windows](assets/wslens-hero.png)
 
-`wslens` lets WSL scripts list, capture, move, resize, focus, close, click, drag, and type into Windows top-level windows.
+`wslens` lets scripts list, capture, move, resize, focus, close, click, drag, and type into Windows top-level windows. It runs from WSL or directly on Windows.
 
 It is useful when a tool runs inside WSL but the application under test opens in Windows user space. For example, a coding agent can launch a Windows app, inspect its windows, take screenshots, resize it into a known shape, focus it, and close it again from the WSL side.
 
 That closes the feedback loop for agentic development: the harness can see the result of what it changed instead of relying only on logs, build output, or the user describing the UI.
 
-`wslens` is a small Bash wrapper plus a PowerShell backend that calls Windows APIs through `user32.dll`.
+`wslens` is a PowerShell backend that calls Windows APIs through `user32.dll`, plus thin entry points for WSL (Bash wrapper) and pure Windows (`.cmd` shim). It also works on plain Windows without WSL.
 
 ## Requirements
 
-- WSL on Windows
-- `powershell.exe` available in the WSL `PATH`
-- `wslpath` and `realpath`
+- Windows with `powershell.exe`
+- For the WSL wrapper: WSL, `powershell.exe` in the WSL `PATH`, `wslpath`, `realpath`
 
 ## Install
+
+### WSL
 
 ```bash
 ./install.sh
@@ -28,6 +29,23 @@ This installs:
 - `~/.local/share/wslens/wslens.ps1`
 
 Make sure `~/.local/bin` is in your `PATH`.
+
+### Pure Windows (no WSL)
+
+From PowerShell in the repo directory:
+
+```powershell
+.\install.ps1
+```
+
+This installs `wslens.cmd` and `wslens.ps1` into `%LOCALAPPDATA%\wslens` (override with `$env:WSLENS_INSTALL_DIR`) and prints PATH advice if the directory is not already in `PATH`. After that, `wslens` works from both cmd and PowerShell:
+
+```powershell
+wslens list
+wslens capture title:Notepad -o shot.png
+```
+
+Relative `-o` paths resolve against the current directory; absolute Windows paths work as-is.
 
 ## Usage
 
